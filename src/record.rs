@@ -95,14 +95,18 @@ impl<'a> Serializable<'a> for MultiPlexedRecord<'a> {
     }
 
     fn deserialize(buffer: &'a [u8]) -> Option<MultiPlexedRecord<'a>> {
-        let enum_tag = RecordType::try_from(buffer[0]).ok()?;
-        if buffer.len() < 8 {
+        if buffer.len() < 11 {
             return None;
         }
+        let enum_tag = RecordType::try_from(buffer[0]).ok()?;
         let position = u64::from_le_bytes(buffer[1..9].try_into().unwrap());
         let queue_len = u16::from_le_bytes(buffer[9..11].try_into().unwrap()) as usize;
-        let queue = std::str::from_utf8(&buffer[11..][..queue_len]).ok()?;
-        let payload = &buffer[11 + queue_len..];
+        let remaining = &buffer[11..];
+        if remaining.len() < queue_len {
+            return None;
+        }
+        let queue = std::str::from_utf8(&remaining[..queue_len]).ok()?;
+        let payload = &remaining[queue_len..];
         match enum_tag {
             RecordType::AppendRecords => Some(MultiPlexedRecord::AppendRecords {
                 queue,
@@ -118,7 +122,11 @@ impl<'a> Serializable<'a> for MultiPlexedRecord<'a> {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct MultiRecord<'a> {
+    /// The buffer contains concatenated items following this pattern:
+    /// <u64 position><u32 len><len bytes>
+    /// The two integers are encoded as little endian.
     buffer: &'a [u8],
+    /// Offset into the buffer above used while iterating over the serialized items.
     byte_offset: usize,
 }
 
@@ -185,7 +193,7 @@ impl<'a> Iterator for MultiRecord<'a> {
         }
 
         let buffer = &self.buffer[self.byte_offset..];
-        if buffer.len() < 10 {
+        if buffer.len() < 12 {
             // too short: corrupted
             self.byte_offset = buffer.len();
             return Some(Err(MultiRecordCorruption));
@@ -209,9 +217,9 @@ impl<'a> Iterator for MultiRecord<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::{MultiRecord, MultiPlexedRecord, RecordType};
     use std::convert::TryFrom;
-
-    use super::RecordType;
+    use crate::Serializable;
 
     #[test]
     fn test_record_type_serialize() {
@@ -223,5 +231,87 @@ mod tests {
             }
         }
         assert_eq!(num_record_types, 4);
+    }
+
+    #[test]
+    fn test_multirecord_deserialization_ok() {
+        let mut buffer: Vec<u8> = vec![];
+        MultiRecord::serialize(
+            [b"123".as_slice(), b"4567".as_slice()].into_iter(),
+            5,
+            &mut buffer,
+        );
+        match MultiRecord::new(&buffer) {
+            Err(_) => panic!("Parsing serialized buffers should work"),
+            Ok(record) => {
+                let items: Vec<_> = record
+                    .into_iter()
+                    .map(|item| item.expect("Deserializing item should work"))
+                    .collect();
+                assert_eq!(
+                    items,
+                    vec![(5u64, b"123".as_slice()), (6u64, b"4567".as_slice())]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_multirecord_deserialization_corruption() {
+        let mut buffer: Vec<u8> = vec![];
+        MultiRecord::serialize(
+            [b"123".as_slice(), b"4567".as_slice()].into_iter(),
+            5,
+            &mut buffer,
+        );
+        for num_truncated_bytes in 1..buffer.len() {
+            // This should not panic. Typically, this will be an error, but
+            // deserializing can also succeed (but will have wrong data).
+            let _ = MultiRecord::new(&buffer[..buffer.len() - num_truncated_bytes]);
+        }
+    }
+
+    #[test]
+    fn test_multiplexedrecord_deserialization_ok() {
+        let mut buffer_multirecord: Vec<u8> = vec![];
+        MultiRecord::serialize(
+            [b"123".as_slice()].into_iter(),
+            2,
+            &mut buffer_multirecord,
+        );
+        let record = MultiPlexedRecord::AppendRecords {
+            queue: "queue_name",
+            position: 10,
+            records: MultiRecord::new_unchecked(&buffer_multirecord),
+        };
+        let mut buffer_multiplexed: Vec<u8> = vec![];
+        record.serialize(&mut buffer_multiplexed);
+        match MultiPlexedRecord::deserialize(&buffer_multiplexed) {
+            None => panic!("Deserialization should work"),
+            Some(parsed_record) => assert_eq!(parsed_record, record),
+        }
+    }
+
+    #[test]
+    fn test_multiplexedrecord_deserialization_corruption() {
+        let mut buffer_multirecord: Vec<u8> = vec![];
+        MultiRecord::serialize(
+            [b"123".as_slice()].into_iter(),
+            2,
+            &mut buffer_multirecord,
+        );
+        let record = MultiPlexedRecord::AppendRecords {
+          queue: "queue_name",
+            position: 10,
+            records: MultiRecord::new_unchecked(&buffer_multirecord),
+        };
+        let mut buffer_multiplexed: Vec<u8> = vec![];
+        record.serialize(&mut buffer_multiplexed);
+
+        for num_truncated_bytes in 1..buffer_multiplexed.len() {
+            // This should not panic. Typically, this will be an error, but
+            // deserializing can also succeed (but will have wrong data).
+            let _ = MultiPlexedRecord::deserialize(&buffer_multiplexed[..buffer_multiplexed.len() - num_truncated_bytes]);
+        }
     }
 }
